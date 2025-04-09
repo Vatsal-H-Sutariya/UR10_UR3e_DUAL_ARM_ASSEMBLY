@@ -428,8 +428,34 @@ class RobotMover(Node):
 
         # For each theta1 solution
         for theta1 in theta1_options:
-            solution = [theta1]
-            solutions.append(solution)
+            c1 = math.cos(theta1)
+            s1 = math.sin(theta1)
+
+            # Step 2: Solve for theta5 (two solutions: wrist up/down)
+            arg = (px * s1 - py * c1 - d4) / d6
+            if abs(arg) > 1:
+                continue
+            theta5_options = [
+                math.acos(arg),
+                -math.acos(arg)
+            ]
+
+            # For each theta5 solution
+            for theta5 in theta5_options:
+                s5 = math.sin(theta5)
+                c5 = math.cos(theta5)
+
+                # Step 3: Solve for theta6
+                if abs(s5) < 1e-6:  # Singularity case
+                    theta6 = 0.0  # Arbitrary choice when s5 = 0
+                else:
+                    theta6 = math.atan2(
+                        (-ny * s1 + oy * c1) / s5,
+                        -(-nx * s1 + ox * c1) / s5
+                    )
+
+                solution = [theta1,theta5]
+                solutions.append(solution)
 
             
 
@@ -561,7 +587,7 @@ class RobotMover(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    node.move_robot('ur3', [math.pi, 0, 0, 0, math.pi/2, 0.0])
+    node.move_robot('ur3', [math.pi, 0, 0, math.pi/2, math.pi, 0.0])
     time.sleep(3)
     position, orientation = node.get_end_effector_pose('ur10e')
     
@@ -578,7 +604,7 @@ def main(args=None):
     solutions = node.inverse_kinematics(T_desired, 'ur3')
     for i, sol in enumerate(solutions):
         print(f"Solution {i + 1}: {sol}")
-        node.move_robot('ur3', [sol[0], 0, 0, 0, 0.0, 0.0])
+        node.move_robot('ur3', [sol[0], 0, 0, 0, sol[1], 0.0])
         time.sleep(2)
 
     print('done')
