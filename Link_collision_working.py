@@ -10,6 +10,13 @@ import time
 import numpy as np
 import tf2_ros
 from tf_transformations import quaternion_from_euler, quaternion_from_matrix, quaternion_about_axis
+import threading
+import socket
+import time
+ROBOT_IP_UR3 = "192.168.0.50"  # Change this to match your setup
+PORT = 30003  # UR10 secondary interface port
+ROBOT_IP_UR10e = "192.168.0.51"
+
 
 class Cylinder:
     def __init__(self, position, direction, length, diameter, robot_type, link_id):
@@ -551,12 +558,66 @@ class RobotMover(Node):
         self.publish_markers(robot_type)
 
     def example(self, shoulder):
-        self.move_robot('ur10e', [-0.4, shoulder, -1.57, 3.14, 0.0, 0.0])
-        self.move_robot('ur3', [0, -1.57, 1.57, 0, 0.0, 0.0])
-        collisions = self.check_collisions()
-        print(collisions)
-        if len(collisions) != 0:
-            return 0
+
+        t1 = threading.Thread(target = run_ur3, arrgs = ())
+        t1.start()
+        t1.join()
+        time.sleep(2)
+        gripper_activate = "rq_activate_and_wait()\n"  # Activates the gripper
+        gripper_close = "rq_set_pos(0)\n"
+
+        try:
+            with socket.create_connection((ROBOT_IP, PORT), timeout=5) as s:
+
+                print("Connected to UR10!")
+
+                s.sendall(gripper_activate.encode('utf-8'))
+                print(f"Sent command: {gripper_activate.strip()}")
+                time.sleep(2)
+
+                self.move_robot('ur10e', [-0.4, shoulder, -1.57, 3.14, 0.0, 0.0])
+                self.move_robot('ur3', [0, -1.57, 1.57, 0, 0.0, 0.0])
+                collisions = self.check_collisions()
+                print(collisions)
+                if len(collisions) != 0:
+                    return 0
+                move_command1 = f"movej([{', '.join(map(str, [0, -1.57, 1.57, 0, 0.0, 0.0]))}], a=0.4, v=0.5)\n"
+                s.sendall(move_command1.encode('utf-8'))
+                print(f"Sent command: {move_command1.strip()}")
+
+
+
+                # Wait for the robot to move
+
+                time.sleep(5)
+
+                s.sendall(move_command2.encode('utf-8'))
+
+                print(f"Sent command: {move_command2.strip()}")
+
+
+
+                # Wait for the robot to move
+
+                time.sleep(5)
+
+
+
+                s.sendall(gripper_close.encode('utf-8'))
+
+                print(f"Sent command: {gripper_close.strip()}")
+
+
+
+                # Wait for the robot to move
+
+                time.sleep(5)
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+
+        
        
         time.sleep(2)
         self.move_robot('ur10e', [-0.3, shoulder, -1.57, 3.14, 0.0, 0.0])
@@ -613,6 +674,8 @@ def main(args=None):
     node = RobotMover()
     
     
+
+
     suc = node.example(-1)
     if suc ==1 :
         print("path complete")
