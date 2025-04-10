@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rclpy
+
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import TransformStamped, Point
@@ -9,13 +10,13 @@ import math
 import time
 import numpy as np
 import tf2_ros
-from tf_transformations import quaternion_from_euler, quaternion_from_matrix, quaternion_about_axis,quaternion_matrix
-
+from tf_transformations import quaternion_from_euler, quaternion_from_matrix, quaternion_about_axis, quaternion_matrix
+import threading
 import socket
 import time
-ROBOT_IP = "192.168.0.51"  # Change this to match your setup
-PORT = 30002  # UR10 secondary interface port
-
+ROBOT_IP_UR3 = "192.168.0.50"  # Change this to match your setup
+PORT = 30003  # UR10 secondary interface port
+ROBOT_IP_UR10e = "192.168.0.51"
 
 
 class Cylinder:
@@ -49,7 +50,7 @@ class RobotMover(Node):
             'ur10e_wrist_3_joint'
         ]
         self.ur3_joint_names = [
-            'ur3_shoulder_pan_joint',
+            'ur3_shoulder_pan_joint', 
             'ur3_shoulder_lift_joint',
             'ur3_elbow_joint',
             'ur3_wrist_1_joint',
@@ -82,13 +83,23 @@ class RobotMover(Node):
         ]
 
         # Approximate link diameters (in meters)
-        self.base_to_origin_ur10e = self.get_transform( math.pi, -1,0,0)
-        self.base_to_origin_ur3 = self.get_transform( math.pi, 0,0,0)
+        self.base_to_origin_ur10e = self.pose_to_transform(0.774 , 0.4113 , 0, 0, 0, -1.57079632)
+        self.base_to_origin_ur3 = self.pose_to_transform( -0.5785 , 0.2265 , 0, 0, 0, 1.57079632)
  
         self.ur10e_diameters = [0.15, 0.12, 0.10, 0.08, 0.08, 0.06]
         self.ur3_diameters = [0.12, 0.10, 0.08, 0.06, 0.06, 0.05]
+
         self.second_link_offset_ur10e = 0.2
         self.second_link_offset_ur3 = 0.1
+
+        self.UR10e_ee_length = 0.21
+        self.UR10e_ee_dia = 0.10
+        self.UR10e_ee_TCP = 0.19
+
+        self.UR3_ee_length = 0.21
+        self.UR3_ee_dia = 0.10
+        self.UR3_ee_TCP = 0.19
+
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.cylinders = []  # List to store all cylinders
         self.start_time = time.time()
@@ -103,14 +114,47 @@ class RobotMover(Node):
             [0.0, 0.0, 0.0, 1.0]
         ])
 
+    def pose_to_transform(self, x, y, z, roll, pitch, yaw):
+        
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(roll), -np.sin(roll)],
+            [0, np.sin(roll), np.cos(roll)]
+        ])
+        
+        Ry = np.array([
+            [np.cos(pitch), 0, np.sin(pitch)],
+            [0, 1, 0],
+            [-np.sin(pitch), 0, np.cos(pitch)]
+        ])
+        
+        Rz = np.array([
+            [np.cos(yaw), -np.sin(yaw), 0],
+            [np.sin(yaw), np.cos(yaw), 0],
+            [0, 0, 1]
+        ])
+
+        # Combine rotations: R = Rz * Ry * Rx
+        R = Rz @ Ry @ Rx
+
+        # Construct the homogeneous transformation matrix
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [x, y, z]
+
+        return T
+
+
     def get_end_effector_pose(self, robot_type: str):
         robot_type = robot_type.lower()
         if robot_type == 'ur10e':
             joints = self.ur10e_current_positions
             dh_params = self.ur10e_dh
+            T_tool = self.pose_to_transform(0,0,self.UR10e_ee_TCP,0,0,0)
         elif robot_type == 'ur3':
             joints = self.ur3_current_positions
             dh_params = self.ur3_dh
+            T_tool = self.pose_to_transform(0,0,self.UR3_ee_TCP,0,0,0)
         else:
             self.get_logger().error('Invalid robot_type')
             return None, None
@@ -120,9 +164,11 @@ class RobotMover(Node):
             T = self.base_to_origin_ur10e
         elif robot_type == 'ur3':
             T = self.base_to_origin_ur3
-        
-        for i in range(5):
+        else:
+            print("ffffffffffffffffffffffff")
+        for i in range(6):
             T = T @ self.get_transform(joints[i], dh_params[i][0], dh_params[i][1], dh_params[i][2])
+        T = T @  T_tool
         position = T[:3, 3]
         roll = math.atan2(T[2,1], T[2,2])
         pitch = math.atan2(-T[2,0], math.sqrt(T[2,1]**2 + T[2,2]**2))
@@ -155,30 +201,36 @@ class RobotMover(Node):
 
 
     def get_link_poses(self, robot_type: str):
-        """Calculate position and orientation of each link"""
+        
         robot_type = robot_type.lower()
         if robot_type == 'ur10e':
             joints = self.ur10e_current_positions
             dh_params = self.ur10e_dh
             diameters = self.ur10e_diameters
-
+            T_tool = self.pose_to_transform(0,0,self.UR10e_ee_TCP,0,0,0)
+            tool_dia = self.UR10e_ee_dia
         elif robot_type == 'ur3':
             joints = self.ur3_current_positions
             dh_params = self.ur3_dh
             diameters = self.ur3_diameters
+            T_tool = self.pose_to_transform(0,0,self.UR3_ee_TCP,0,0,0)
+            tool_dia = self.UR3_ee_dia
         else:
             return []
 
         poses = []
         T = np.eye(4)
+        T_third = np.eye(4)
         if robot_type == 'ur10e':
             T = self.base_to_origin_ur10e
+            T_third = self.base_to_origin_ur3
         elif robot_type == 'ur3':
             T = self.base_to_origin_ur3
+            T_third = self.base_to_origin_ur10e
         prev_pos = np.array(T[:3, 3])
                 
-        T_third = np.eye(4)
-        for j in range(3):  # Up to third joint (elbow_joint)
+        
+        for j in range(2):  # Up to third joint (elbow_joint)
             T_third = T_third @ self.get_transform(joints[j], dh_params[j][0], dh_params[j][1], dh_params[j][2])
         z_axis = T_third[:3, 2]  # Third column is z-axis
         z_axis = z_axis / np.linalg.norm(z_axis) if np.linalg.norm(z_axis) > 1e-6 else np.array([0, 0, 1])
@@ -202,11 +254,20 @@ class RobotMover(Node):
                 midpoint = midpoint - offset_vector
             poses.append((midpoint.tolist(), direction.tolist() , length, diameters[i]))
             prev_pos = curr_pos.copy()
-        
+
+        T = T @  T_tool
+
+        curr_pos = T[:3, 3]
+        length = np.linalg.norm(curr_pos - prev_pos)
+        direction = (curr_pos - prev_pos) / length if length > 0 else np.array([0, 0, 1])
+        midpoint = (prev_pos + curr_pos) / 2    
+        poses.append((midpoint.tolist(), direction.tolist() , length, tool_dia))
+
+
         return poses
 
     def update_cylinder_list(self):
-        """Update the list of cylinders for both robots"""
+        
         self.cylinders = []
         
         # Get poses for both robots
@@ -222,8 +283,7 @@ class RobotMover(Node):
             self.cylinders.append(Cylinder(pos, direction, length, diameter, 'ur3', i))    
 
     def cylinder_collision(self, cyl1: Cylinder, cyl2: Cylinder) -> bool:
-        """Check collision between two cylinders with improved accuracy"""
-        # Skip adjacent links of same robot
+        
         if cyl1.robot_type == cyl2.robot_type and abs(cyl1.link_id - cyl2.link_id) <= 1:
             return False
 
@@ -286,7 +346,7 @@ class RobotMover(Node):
         return collision    
 
     def check_collisions(self):
-        """Check for collisions between all cylinders"""
+       
         self.update_cylinder_list()
         collisions = []
         
@@ -305,7 +365,7 @@ class RobotMover(Node):
         return collisions
 
     def publish_markers(self, robot_type: str):
-        """Publish cylinder markers for each link"""
+       
         poses = self.get_link_poses(robot_type)
         if not poses:
             return
@@ -369,101 +429,177 @@ class RobotMover(Node):
 
 
 
-    def inverse_kinematics(self, T_desired, robot_type: str):
-        """
-        Calculate inverse kinematics for UR10e or UR3 given desired end-effector pose.
-        
-        Args:
-            T_desired: 4x4 numpy array representing desired end-effector transformation
-            robot_type: 'ur10e' or 'ur3'
-            
-        Returns:
-            List of possible joint angle solutions [theta1, theta2, theta3, theta4, theta5, theta6]
-        """
-        # Extract position and orientation from desired transform
-        px = T_desired[0, 3]
-        py = T_desired[1, 3]
-        pz = T_desired[2, 3]
-        
-        # Rotation matrix components
-        nx, ny, nz = T_desired[0, 0], T_desired[1, 0], T_desired[2, 0]
-        ox, oy, oz = T_desired[0, 1], T_desired[1, 1], T_desired[2, 1]
-        ax, ay, az = T_desired[0, 2], T_desired[1, 2], T_desired[2, 2]
 
-        # Select DH parameters based on robot type
+    def inverse_kinematics(self, T_desired, robot_type: str):
+         
         if robot_type.lower() == 'ur10e':
-            d1 = 0.1807
-            a2 = -0.6127
-            a3 = -0.57155
-            d4 = 0.17415
-            d5 = 0.11985
-            d6 = 0.11655
+            d1, a2, a3, d4, d5, d6 = 0.1807, -0.6127, -0.57155, 0.17415, 0.11985, 0.11655
+            T_base = self.base_to_origin_ur10e
+            T_tool = self.pose_to_transform(0,0,self.UR10e_ee_TCP,0,0,0)
         elif robot_type.lower() == 'ur3':
-            d1 = 0.1519
-            a2 = -0.24365
-            a3 = -0.21325
-            d4 = 0.11235
-            d5 = 0.08535
-            d6 = 0.0819
+            d1, a2, a3, d4, d5, d6 = 0.1519, -0.24365, -0.21325, 0.11235, 0.08535, 0.0819
+            T_base = self.base_to_origin_ur3
+            T_tool = self.pose_to_transform(0,0,self.UR3_ee_TCP,0,0,0)
         else:
             self.get_logger().error('Invalid robot_type')
             return []
 
+        # Transform desired pose to base frame
+        T_base_inv = np.linalg.inv(T_base)
+        T_desired_base = T_base_inv @ T_desired
+
+        T_tool_inv = np.linalg.inv(T_tool)
+        T_desired_flange = T_desired_base @ T_tool_inv
+
+        # Extract position and orientation
+        nx, ny, nz = T_desired_flange[0, 0], T_desired_flange[1, 0], T_desired_flange[2, 0]
+        ox, oy, oz = T_desired_flange[0, 1], T_desired_flange[1, 1], T_desired_flange[2, 1]
+        ax, ay, az = T_desired_flange[0, 2], T_desired_flange[1, 2], T_desired_flange[2, 2]
+        px, py, pz = T_desired_flange[0, 3], T_desired_flange[1, 3], T_desired_flange[2, 3]
+
         solutions = []
 
-        # Step 1: Solve for theta1 (two solutions: shoulder left/right)
-        p05 = np.array([px - d6 * ax, py - d6 * ay, pz - d6 * az])
-        print(p05)
-        R = np.sqrt(p05[0]**2 + p05[1]**2)
-        
+        # θ1 (two solutions: shoulder left/right)
+        m = d6 * ay - py
+        n = ax * d6 - px
+        R = math.sqrt(m**2 + n**2)
         if R < abs(d4):
-            return []  # No solution possible
-        
-        alpha1 = math.atan2(p05[1], p05[0])
-        alpha2 = math.acos(d4 / R)
+            print("theta 1 error : R < d4")
+            return []
         theta1_options = [
-            alpha1 + alpha2 + math.pi/2,
-            alpha1 - alpha2 + math.pi/2
+            math.atan2(m, n) - math.atan2(d4, math.sqrt(R**2 - d4**2)),
+            math.atan2(m, n) - math.atan2(d4, -math.sqrt(R**2 - d4**2))
         ]
 
-        # For each theta1 solution
         for theta1 in theta1_options:
-            c1 = math.cos(theta1)
-            s1 = math.sin(theta1)
+            s1, c1 = math.sin(theta1), math.cos(theta1)
 
-            # Step 2: Solve for theta5 (two solutions: wrist up/down)
-            arg = (px * s1 - py * c1 - d4) / d6
+            # θ (two solutions: wrist up/down)
+            arg = ax * s1 - ay * c1
             if abs(arg) > 1:
                 continue
-            theta5_options = [
-                math.acos(arg),
-                -math.acos(arg)
-            ]
+            theta5_options = [math.acos(arg), -math.acos(arg)]
 
-            # For each theta5 solution
             for theta5 in theta5_options:
-                s5 = math.sin(theta5)
-                c5 = math.cos(theta5)
+                s5, c5 = math.sin(theta5), math.cos(theta5)
 
-                # Step 3: Solve for theta6
-                if abs(s5) < 1e-6:  # Singularity case
-                    theta6 = 0.0  # Arbitrary choice when s5 = 0
-                else:
-                    theta6 = math.atan2(
-                        (-ny * s1 + oy * c1) / s5,
-                        -(-nx * s1 + ox * c1) / s5
-                    )
+                # θ
+                mm = nx * s1 - ny * c1
+                nn = ox * s1 - oy * c1
+                theta6 = math.atan2(mm, nn) - math.atan2(s5, 0) if abs(s5) > 1e-6 else 0.0
 
-                solution = [theta1,theta5]
-                solutions.append(solution)
+                # Compute wrist position for θ, θ
+                m = d5 * (math.sin(theta6) * (nx * c1 + ny * s1) + math.cos(theta6) * (ox * c1 + oy * s1)) - \
+                    d6 * (ax * c1 + ay * s1) + px * c1 + py * s1
+                n = pz - d1 - az * d6 + d5 * (oz * math.cos(theta6) + nz * math.sin(theta6))
 
-            
+                # θ (two solutions: elbow up/down)
+                D = (m**2 + n**2 - a2**2 - a3**2) / (2 * abs(a2) * abs(a3))
+                if abs(D) > 1.01:  # Relaxed boundary
+                    continue
+                D = max(min(D, 1.0), -1.0)
+                theta3_options = [math.acos(D), -math.acos(D)]
+
+                for theta3 in theta3_options:
+                    s3, c3 = math.sin(theta3), math.cos(theta3)
+
+                    # θ
+                    s2 = ((a3 * c3 + a2) * n - a3 * s3 * m) / (a2**2 + a3**2 + 2 * a2 * a3 * c3)
+                    c2 = (m + a3 * s3 * s2) / (a3 * c3 + a2)
+                    theta2 = math.atan2(s2, c2)
+
+                    # θ
+                    theta4 = math.atan2(
+                        -math.sin(theta6) * (nx * c1 + ny * s1) - math.cos(theta6) * (ox * c1 + oy * s1),
+                        oz * math.cos(theta6) + nz * math.sin(theta6)
+                    ) - theta2 - theta3
+
+                    solutions.append([theta1, theta2, theta3, theta4, theta5, theta6])
 
         return solutions
 
-    def plan_path(self):
-        return
+    def heuristic(self, a, b):
+        return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2 + (a[2] - b[2])**2)
 
+    def is_in_obstacle(self, pos, obstacles):
+        collisions = self.check_collisions()
+        print(collisions)
+        if len(collisions) != 0:
+            return True
+        else:        
+            return False
+
+    def a_star_path(self, start_pos, goal_pos, obstacles, resolution=0.05):
+       
+        open_list = []
+        closed_set = set()
+        heapq.heappush(open_list, (0, start_pos, []))
+
+        # Dynamic step size: scale based on start-to-goal distance
+        dist = self.heuristic(start_pos, goal_pos)
+        stepsize = resolution * max(1.0, dist / 0.5)  # Scale up for larger distances
+
+        directions = [
+            [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
+            [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
+            [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+            [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
+            [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+            [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]
+        ]
+
+        max_iterations = 1000  # Prevent infinite loops
+        i = 0
+        while open_list and i < max_iterations:
+            i += 1
+            _, current, path = heapq.heappop(open_list)
+            if abs(current[0] - goal_pos[0]) < resolution and \
+               abs(current[1] - goal_pos[1]) < resolution and \
+               abs(current[2] - goal_pos[2]) < resolution:
+                return path + [current]
+            
+            closed_set.add(current)
+            for move in directions:
+                neighbor = (
+                    current[0] + move[0] * stepsize,
+                    current[1] + move[1] * stepsize,
+                    current[2] + move[2] * stepsize
+                )
+                if neighbor not in closed_set and not self.is_in_obstacle(neighbor, obstacles):
+                    g_cost = len(path) + 1
+                    h_cost = self.heuristic(neighbor, goal_pos)
+                    f_cost = g_cost + h_cost
+                    heapq.heappush(open_list, (f_cost, neighbor, path + [current]))
+        
+        self.get_logger().warning("No path found")
+        return None
+
+    def plan_run_path(self, start_pos, goal_pos, orientation, robot_type, obstacles):
+        
+        path = self.a_star_path(start_pos, goal_pos, obstacles)
+        if not path:
+            self.get_logger().error("Path planning failed")
+            return
+
+        # Convert orientation to 4x4 matrix
+        T_orient = np.eye(4)
+        T_orient[0:3, 0:3] = orientation
+
+        self.get_logger().info(f"Path found with {len(path)} waypoints")
+        for waypoint in path:
+            T_desired = T_orient.copy()
+            T_desired[0:3, 3] = waypoint
+            solutions = self.inverse_kinematics(T_desired, robot_type)
+            if solutions:
+                # Use the first valid solution (could add selection logic)
+                joint_angles = solutions[0]
+                self.move_robot(robot_type, joint_angles)
+                T_fk = self.forward_kinematics(joint_angles, robot_type)
+                self.get_logger().info(f"Moved to {waypoint}, Joints: {joint_angles}")
+                self.get_logger().info(f"FK Position: {T_fk[0:3, 3]}")
+                time.sleep(1)  # Simulate movement delay
+            else:
+                self.get_logger().warning(f"No IK solution for waypoint {waypoint}")
 
 
     def move_robot(self, robot_type: str, joint_positions: list):
@@ -498,38 +634,40 @@ class RobotMover(Node):
 
     def example(self, shoulder):
 
-        time.sleep(2)
         
+        time.sleep(2)
         gripper_activate = "rq_activate_and_wait()\n"  # Activates the gripper
         gripper_close = "rq_set_pos(0)\n"
 
-        try:
-            with socket.create_connection((ROBOT_IP, PORT), timeout=2) as s:
+        
+        s_UR10e =  socket.create_connection((ROBOT_IP_UR10e, PORT), timeout=5) 
+        s_UR3 = socket.create_connection((ROBOT_IP_UR3, PORT), timeout=5) 
+        print("Connected to UR10!")
 
-                print("Connected to UR10!")
+        s_UR10e.sendall(gripper_activate.encode('utf-8'))
+        print(f"Sent command: {gripper_activate.strip()}")
+        time.sleep(2)
 
-                s.sendall(gripper_activate.encode('utf-8'))
-                print(f"Sent command: {gripper_activate.strip()}")
-                time.sleep(2)
+        self.move_robot('ur10e', [0, -1.57, 1.57, 0, 0.0, 0.0])
+        self.move_robot('ur3', [math.pi, -1.57, 1.57, 0, 0.0, 0.0])
+        collisions = self.check_collisions()
+        print(collisions)
+        if len(collisions) != 0:
+            return 0
+        move_command1 = f"movej([{', '.join(map(str, [0, -1.65, -1.57, 0, math.pi, 0.0]))}], a=0.4, v=0.2)\n"
+        move_command2 = f"movej([{', '.join(map(str, [0, -1.65, 1.57, 0, 0.0, 0.0]))}], a=0.4, v=0.2)\n"
+        
+        s_UR10e.sendall(move_command1.encode('utf-8'))
+        s_UR3.sendall(move_command2.encode('utf-8'))
 
-                self.move_robot('ur10e', [-0.4, shoulder, -1.57, 3.14, 0.0, 0.0])
-                self.move_robot('ur3', [0, -1.57, 1.57, 0, 0.0, 0.0])
-                collisions = self.check_collisions()
-                print(collisions)
-                if len(collisions) != 0:
-                    return 0
+        print(f"Sent command: {move_command1.strip()}")
+        time.sleep(5)
 
-                move_command1 = f"movej([{', '.join(map(str, [-0.4, shoulder, -1.57, 3.14, 0.0, 0.0]))}], a=0.4, v=0.5)\n"
-                s.sendall(move_command1.encode('utf-8'))
-                print(f"Sent command: {move_command1.strip()}")
-                time.sleep(5)
+        s_UR10e.sendall(gripper_close.encode('utf-8'))
+        print(f"Sent command: {gripper_close.strip()}")
+        time.sleep(5)
 
-                s.sendall(gripper_close.encode('utf-8'))
-                print(f"Sent command: {gripper_close.strip()}")
-                time.sleep(5)
-
-        except Exception as e:
-            print(f"Error: {e}")
+        
 
 
         
@@ -587,9 +725,20 @@ class RobotMover(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RobotMover()
-    node.move_robot('ur3', [math.pi, 0, 0, math.pi/2, math.pi, 0.0])
-    time.sleep(3)
-    position, orientation = node.get_end_effector_pose('ur10e')
+    
+    
+
+    '''
+    suc = node.example(-1)
+    if suc ==1 :
+        print("path complete")
+    else:
+        print("collision!!!!!!!!!!!!!!")
+    '''
+    node.move_robot('ur3', [0, -math.pi/2, math.pi/2, 0, 0, 0.0])
+    print("moving to ")
+    time.sleep(5)
+    position, orientation = node.get_end_effector_pose('ur3')
     
     T_desired = np.eye(4)
     T_desired[:3, 3] = position
@@ -602,13 +751,13 @@ def main(args=None):
     print(T_desired)
 
     solutions = node.inverse_kinematics(T_desired, 'ur3')
+    print(solutions)
     for i, sol in enumerate(solutions):
         print(f"Solution {i + 1}: {sol}")
-        node.move_robot('ur3', [sol[0], 0, 0, 0, sol[1], 0.0])
-        time.sleep(2)
+        node.move_robot('ur3', sol)
+        time.sleep(5)
 
     print('done')
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
